@@ -24,6 +24,7 @@
 #include "keeshare/KeeShare.h"
 
 #include <QDir>
+#include <QSignalBlocker>
 #include <QStandardPaths>
 
 EditGroupWidgetKeeShare::EditGroupWidgetKeeShare(QWidget* parent)
@@ -40,10 +41,12 @@ EditGroupWidgetKeeShare::EditGroupWidgetKeeShare(QWidget* parent)
     m_ui->passwordEdit->enablePasswordGenerator();
 
     connect(m_ui->passwordEdit, SIGNAL(textChanged(QString)), SLOT(selectPassword()));
+    connect(m_ui->pathEdit, SIGNAL(textChanged(QString)), SLOT(updateUncTimeoutState()));
     connect(m_ui->pathEdit, SIGNAL(editingFinished()), SLOT(selectPath()));
     connect(m_ui->pathSelectionButton, SIGNAL(pressed()), SLOT(launchPathSelectionDialog()));
     connect(m_ui->typeComboBox, SIGNAL(currentIndexChanged(int)), SLOT(selectType()));
     connect(m_ui->keepGroupsCheckbox, SIGNAL(toggled(bool)), SLOT(keepGroupsToggled(bool)));
+    connect(m_ui->uncTimeoutSpinBox, SIGNAL(valueChanged(int)), SLOT(selectUncTimeout(int)));
     connect(m_ui->clearButton, SIGNAL(clicked(bool)), SLOT(clearInputs()));
 
     connect(KeeShare::instance(), SIGNAL(activeChanged()), SLOT(updateSharingState()));
@@ -91,6 +94,23 @@ void EditGroupWidgetKeeShare::setGroup(Group* temporaryGroup, QSharedPointer<Dat
     update();
 }
 
+void EditGroupWidgetKeeShare::updateUncTimeoutState()
+{
+    const bool isEnabled = m_ui->typeComboBox->currentData().toInt() > KeeShareSettings::Inactive;
+    const QString currentPath = m_ui->pathEdit->text();
+    bool isUnc = KeeShareSettings::Reference::isUncPath(currentPath);
+    if (!isUnc && m_database && !currentPath.isEmpty()) {
+        const QFileInfo dbInfo(m_database->filePath());
+        const QString resolved = dbInfo.absoluteDir().absoluteFilePath(currentPath);
+        isUnc = KeeShareSettings::Reference::isUncPath(resolved);
+    }
+
+    m_ui->uncTimeoutLabel->setVisible(isUnc);
+    m_ui->uncTimeoutSpinBox->setVisible(isUnc);
+    m_ui->uncTimeoutLabel->setEnabled(isEnabled && isUnc);
+    m_ui->uncTimeoutSpinBox->setEnabled(isEnabled && isUnc);
+}
+
 void EditGroupWidgetKeeShare::updateSharingState()
 {
     // Only enable controls if we are active
@@ -99,6 +119,7 @@ void EditGroupWidgetKeeShare::updateSharingState()
     m_ui->pathSelectionButton->setEnabled(isEnabled);
     m_ui->passwordEdit->setEnabled(isEnabled);
     m_ui->keepGroupsCheckbox->setEnabled(isEnabled);
+    updateUncTimeoutState();
 
     if (!m_temporaryGroup || !isEnabled) {
         m_ui->messageWidget->hideMessage();
@@ -181,9 +202,11 @@ void EditGroupWidgetKeeShare::updateSharingState()
 
 void EditGroupWidgetKeeShare::update()
 {
+    const QSignalBlocker spinBoxBlocker(m_ui->uncTimeoutSpinBox);
     if (!m_temporaryGroup) {
         m_ui->passwordEdit->clear();
         m_ui->pathEdit->clear();
+        m_ui->uncTimeoutSpinBox->setValue(KeeShareSettings::Reference::DefaultUncTimeout);
     } else {
         const auto reference = KeeShare::referenceOf(m_temporaryGroup);
 
@@ -191,6 +214,7 @@ void EditGroupWidgetKeeShare::update()
         m_ui->passwordEdit->setText(reference.password);
         m_ui->pathEdit->setText(reference.path);
         m_ui->keepGroupsCheckbox->setChecked(reference.keepGroups);
+        m_ui->uncTimeoutSpinBox->setValue(reference.uncTimeout);
     }
 
     updateSharingState();
@@ -201,9 +225,13 @@ void EditGroupWidgetKeeShare::clearInputs()
     if (m_temporaryGroup) {
         KeeShare::setReferenceTo(m_temporaryGroup, KeeShareSettings::Reference());
     }
+    m_ui->typeComboBox->setCurrentIndex(KeeShareSettings::Inactive);
     m_ui->passwordEdit->clear();
     m_ui->pathEdit->clear();
-    m_ui->typeComboBox->setCurrentIndex(KeeShareSettings::Inactive);
+    {
+        const QSignalBlocker spinBoxBlocker(m_ui->uncTimeoutSpinBox);
+        m_ui->uncTimeoutSpinBox->setValue(KeeShareSettings::Reference::DefaultUncTimeout);
+    }
     updateSharingState();
 }
 
@@ -214,6 +242,17 @@ void EditGroupWidgetKeeShare::selectPath()
     }
     auto reference = KeeShare::referenceOf(m_temporaryGroup);
     reference.path = m_ui->pathEdit->text();
+    KeeShare::setReferenceTo(m_temporaryGroup, reference);
+    updateSharingState();
+}
+
+void EditGroupWidgetKeeShare::selectUncTimeout(int timeout)
+{
+    if (!m_temporaryGroup) {
+        return;
+    }
+    auto reference = KeeShare::referenceOf(m_temporaryGroup);
+    reference.uncTimeout = timeout;
     KeeShare::setReferenceTo(m_temporaryGroup, reference);
 }
 

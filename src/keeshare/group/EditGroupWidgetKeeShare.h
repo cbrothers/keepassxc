@@ -48,6 +48,8 @@ private slots:
     void selectPassword();
     void launchPathSelectionDialog();
     void selectPath();
+    void updateUncTimeoutState();
+    void selectUncTimeout(int timeout);
     void keepGroupsToggled(bool);
 
 private:

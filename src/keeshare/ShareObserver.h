@@ -18,8 +18,10 @@
 #ifndef KEEPASSXC_SHAREOBSERVER_H
 #define KEEPASSXC_SHAREOBSERVER_H
 
+#include <QHash>
 #include <QMap>
 #include <QObject>
+#include <QSet>
 
 #include "gui/MessageWidget.h"
 #include "keeshare/KeeShareSettings.h"
@@ -70,8 +72,9 @@ private slots:
     void handleFileUpdated(const QString& path);
 
 private:
-    Result importShare(const QString& path);
-    QList<Result> exportShares();
+    Result importShare(const QString& path, QHash<QString, bool>* hostCache = nullptr);
+    QList<Result> exportShares(bool* skippedUnreachable = nullptr);
+    bool isSharePathReachable(const QString& resolvedPath, int uncTimeout, QHash<QString, bool>& hostCache) const;
 
     void deinitialize();
     void reinitialize();
@@ -82,6 +85,7 @@ private:
     QMap<QPointer<Group>, KeeShareSettings::Reference> m_groupToReference;
     QMap<QString, QPointer<Group>> m_shareToGroup;
     QMap<QString, QSharedPointer<FileWatcher>> m_fileWatchers;
+    QSet<QString> m_skippedShares;
     bool m_inFileUpdate = false;
     bool m_enabled = true;
 };

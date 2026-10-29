@@ -28,6 +28,9 @@ namespace
 {
     QString resolvePath(const QString& path, QSharedPointer<Database> database)
     {
+        if (KeeShareSettings::Reference::isUncPath(path)) {
+            return QDir::fromNativeSeparators(path.trimmed());
+        }
         const QFileInfo info(database->filePath());
         return info.absoluteDir().absoluteFilePath(path);
     }
@@ -67,11 +70,19 @@ void ShareObserver::deinitialize()
     m_groupToReference.clear();
     m_shareToGroup.clear();
     m_fileWatchers.clear();
+    m_skippedShares.clear();
 }
 
 void ShareObserver::reinitialize()
 {
-    QList<QPair<QPointer<Group>, KeeShareSettings::Reference>> shares;
+    struct ShareEntry
+    {
+        QPointer<Group> group;
+        KeeShareSettings::Reference reference;
+        QString resolvedPath;
+    };
+
+    QList<ShareEntry> shares;
     for (Group* group : m_db->rootGroup()->groupsRecursive(true)) {
         auto oldReference = m_groupToReference.value(group);
         auto newReference = KeeShare::referenceOf(group);
@@ -83,14 +94,27 @@ void ShareObserver::reinitialize()
         m_groupToReference.remove(group);
         m_shareToGroup.remove(oldResolvedPath);
         m_fileWatchers.remove(oldResolvedPath);
+        m_skippedShares.remove(oldResolvedPath);
 
+        QString newResolvedPath;
         if (newReference.isValid()) {
             m_groupToReference[group] = newReference;
-            const auto newResolvedPath = resolvePath(newReference.path, m_db);
+            newResolvedPath = resolvePath(newReference.path, m_db);
             m_shareToGroup[newResolvedPath] = group;
         }
 
-        shares.append({group, newReference});
+        shares.append({group, newReference, newResolvedPath});
+    }
+
+    QHash<QString, int> maxHostTimeout;
+    for (const auto& share : shares) {
+        if (!share.group || !share.reference.isValid()) {
+            continue;
+        }
+        const QString host = KeeShareSettings::Reference::extractUncHost(share.resolvedPath).toLower();
+        if (!host.isEmpty()) {
+            maxHostTimeout[host] = qMax(maxHostTimeout.value(host, 0), share.reference.uncTimeout);
+        }
     }
 
     QStringList success;
@@ -98,17 +122,28 @@ void ShareObserver::reinitialize()
     QStringList error;
     QMap<QString, QStringList> imported;
     QMap<QString, QStringList> exported;
+    QHash<QString, bool> hostCache;
+    bool skippedUnreachable = false;
 
     for (const auto& share : shares) {
-        auto group = share.first;
-        auto& reference = share.second;
+        auto group = share.group;
+        const auto& reference = share.reference;
+        const auto& newResolvedPath = share.resolvedPath;
         // Check group validity, it may have been deleted by a merge action
         if (!group) {
             continue;
         }
 
         if (!reference.path.isEmpty() && reference.type != KeeShareSettings::Inactive) {
-            const auto newResolvedPath = resolvePath(reference.path, m_db);
+            const QString host = KeeShareSettings::Reference::extractUncHost(newResolvedPath).toLower();
+            const int probeTimeout = maxHostTimeout.value(host, reference.uncTimeout);
+            if (!isSharePathReachable(newResolvedPath, probeTimeout, hostCache)) {
+                qDebug("KeeShare: Network share host not reachable within %d seconds, skipping sync", probeTimeout);
+                m_skippedShares.insert(newResolvedPath);
+                skippedUnreachable = true;
+                continue;
+            }
+            m_skippedShares.remove(newResolvedPath);
             auto fileWatcher = QSharedPointer<FileWatcher>::create(this);
             connect(fileWatcher.data(), &FileWatcher::fileChanged, this, &ShareObserver::handleFileUpdated);
             fileWatcher->start(newResolvedPath, FileWatchPeriod, FileWatchSize);
@@ -122,7 +157,7 @@ void ShareObserver::reinitialize()
         if (reference.isImporting()) {
             imported[reference.path] << group->name();
             // import has to occur immediately
-            const auto result = this->importShare(reference.path);
+            const auto result = this->importShare(reference.path, &hostCache);
             if (!result.isValid()) {
                 // tolerable result - blocked import or missing source
                 continue;
@@ -138,6 +173,10 @@ void ShareObserver::reinitialize()
                 success << tr("Imported from %1").arg(result.path);
             }
         }
+    }
+
+    if (skippedUnreachable) {
+        warning << tr("Network share host unreachable, sync skipped");
     }
 
     for (auto it = imported.cbegin(); it != imported.cend(); ++it) {
@@ -181,12 +220,30 @@ void ShareObserver::handleDatabaseChanged()
         Q_ASSERT(m_db);
         return;
     }
+
     const auto active = KeeShare::active();
     if (!m_enabled || (!active.out && !active.in)) {
         deinitialize();
     } else {
         reinitialize();
     }
+}
+
+bool ShareObserver::isSharePathReachable(const QString& resolvedPath,
+                                         int uncTimeout,
+                                         QHash<QString, bool>& hostCache) const
+{
+    const QString host = KeeShareSettings::Reference::extractUncHost(resolvedPath).toLower();
+    if (host.isEmpty()) {
+        return true;
+    }
+    auto it = hostCache.constFind(host);
+    if (it != hostCache.cend()) {
+        return it.value();
+    }
+    const bool reachable = KeeShareSettings::Reference::isUncPathActive(resolvedPath, uncTimeout);
+    hostCache.insert(host, reachable);
+    return reachable;
 }
 
 void ShareObserver::handleFileUpdated(const QString& path)
@@ -216,7 +273,7 @@ void ShareObserver::handleFileUpdated(const QString& path)
     }
 }
 
-ShareObserver::Result ShareObserver::importShare(const QString& path)
+ShareObserver::Result ShareObserver::importShare(const QString& path, QHash<QString, bool>* hostCache)
 {
     if (!KeeShare::active().in) {
         return {};
@@ -240,6 +297,12 @@ ShareObserver::Result ShareObserver::importShare(const QString& path)
     Q_ASSERT(shareGroup->database() == m_db);
     Q_ASSERT(shareGroup == m_db->rootGroup()->findGroupByUuid(shareGroup->uuid()));
     const auto resolvedPath = resolvePath(reference.path, m_db);
+    QHash<QString, bool> localHostCache;
+    QHash<QString, bool>& activeCache = hostCache ? *hostCache : localHostCache;
+    if (!isSharePathReachable(resolvedPath, reference.uncTimeout, activeCache)) {
+        qDebug("KeeShare: Network share host not reachable within %d seconds, skipping import", reference.uncTimeout);
+        return {};
+    }
     return ShareImport::containerInto(resolvedPath, reference, shareGroup);
 }
 
@@ -248,13 +311,14 @@ QSharedPointer<Database> ShareObserver::database()
     return m_db;
 }
 
-QList<ShareObserver::Result> ShareObserver::exportShares()
+QList<ShareObserver::Result> ShareObserver::exportShares(bool* skippedUnreachable)
 {
     QList<Result> results;
     struct Reference
     {
         KeeShareSettings::Reference config;
         const Group* group;
+        QString resolvedPath;
     };
 
     QMap<QString, QList<Reference>> references;
@@ -264,7 +328,7 @@ QList<ShareObserver::Result> ShareObserver::exportShares()
         if (!reference.isExporting()) {
             continue;
         }
-        references[reference.path] << Reference{reference, group};
+        references[reference.path] << Reference{reference, group, resolvePath(reference.path, m_db)};
     }
 
     for (auto it = references.cbegin(); it != references.cend(); ++it) {
@@ -283,9 +347,37 @@ QList<ShareObserver::Result> ShareObserver::exportShares()
         return results;
     }
 
+    QHash<QString, int> maxHostTimeout;
+    for (auto it = references.cbegin(); it != references.cend(); ++it) {
+        const auto& ref = it.value().first();
+        const QString host = KeeShareSettings::Reference::extractUncHost(ref.resolvedPath).toLower();
+        if (!host.isEmpty()) {
+            maxHostTimeout[host] = qMax(maxHostTimeout.value(host, 0), ref.config.uncTimeout);
+        }
+    }
+
+    QHash<QString, bool> hostCache;
     for (auto it = references.cbegin(); it != references.cend(); ++it) {
         auto reference = it.value().first();
-        const QString resolvedPath = resolvePath(reference.config.path, m_db);
+        const QString& resolvedPath = reference.resolvedPath;
+        const bool isUnc = KeeShareSettings::Reference::isUncPath(resolvedPath);
+        if (isUnc) {
+            const QString host = KeeShareSettings::Reference::extractUncHost(resolvedPath).toLower();
+            const int probeTimeout = maxHostTimeout.value(host, reference.config.uncTimeout);
+            if (!isSharePathReachable(resolvedPath, probeTimeout, hostCache)) {
+                qDebug("KeeShare: Network share host not reachable within %d seconds, skipping export", probeTimeout);
+                if (skippedUnreachable) {
+                    *skippedUnreachable = true;
+                }
+                continue;
+            }
+            if (m_skippedShares.contains(resolvedPath) && reference.config.isImporting()) {
+                results << Result{reference.config.path,
+                                  Result::Warning,
+                                  tr("Share was unreachable on open; reopen database to synchronize before exporting")};
+                continue;
+            }
+        }
         auto watcher = m_fileWatchers.value(resolvedPath);
         if (watcher) {
             watcher->stop();
@@ -309,8 +401,12 @@ void ShareObserver::handleDatabaseSaved()
     QStringList error;
     QStringList warning;
     QStringList success;
+    bool skippedUnreachable = false;
 
-    const auto results = exportShares();
+    const auto results = exportShares(&skippedUnreachable);
+    if (skippedUnreachable) {
+        warning << tr("Network share host unreachable, sync skipped");
+    }
     for (const Result& result : results) {
         if (!result.isValid()) {
             Q_ASSERT(result.isValid());

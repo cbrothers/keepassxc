@@ -30,10 +30,16 @@ class TestSharing : public QObject
 
 private slots:
     void initTestCase();
+    void cleanup();
     void testNullObjects();
     void testKeySerialization();
     void testReferenceSerialization();
     void testReferenceSerialization_data();
+    void testReferenceInvalidUncTimeoutDeserialization();
+    void testUncPathDetection();
+    void testUncProbeClamping();
+    void testShareObserverHostCachingAndSkip();
+    void testShareObserverSkippedShareLateOnlineExportWarning();
     void testSettingsSerialization();
     void testSettingsSerialization_data();
 

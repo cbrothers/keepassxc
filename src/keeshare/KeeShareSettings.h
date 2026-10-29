@@ -20,6 +20,7 @@
 
 #include <QSharedPointer>
 #include <QUuid>
+#include <functional>
 
 namespace Botan
 {
@@ -29,6 +30,7 @@ namespace Botan
 class CustomData;
 class QXmlStreamWriter;
 class QXmlStreamReader;
+class TestSharing;
 
 namespace KeeShareSettings
 {
@@ -122,22 +124,38 @@ namespace KeeShareSettings
 
     struct Reference
     {
+        static constexpr int DefaultUncTimeout = 3;
+        static constexpr int MinUncTimeout = 1;
+        static constexpr int MaxUncTimeout = 60;
+
         Type type = Inactive;
         QUuid uuid;
         QString path;
         QString password;
         bool keepGroups = true;
+        int uncTimeout = DefaultUncTimeout;
 
         Reference();
         bool isNull() const;
         bool isValid() const;
         bool isExporting() const;
         bool isImporting() const;
+        bool isUncPath() const;
+        static bool isUncPath(const QString& path);
+        static QString extractUncHost(const QString& path);
+        static bool isUncPathActive(const QString& path, int timeoutSeconds = DefaultUncTimeout);
         bool operator<(const Reference& other) const;
         bool operator==(const Reference& other) const;
 
         static QString serialize(const Reference& reference);
         static Reference deserialize(const QString& raw);
+
+    private:
+        // Test-only probe override seam; must only be modified on the main/UI thread.
+        static void setUncProbeFunc(std::function<bool(const QString& host, int timeoutMs)> func);
+        static void resetUncProbeFunc();
+
+        friend class ::TestSharing;
     };
 }; // namespace KeeShareSettings
 

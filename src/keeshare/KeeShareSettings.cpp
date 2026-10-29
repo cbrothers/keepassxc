@@ -17,6 +17,7 @@
 
 #include "KeeShareSettings.h"
 
+#include "config-keepassx.h"
 #include "core/CustomData.h"
 #include "core/Database.h"
 #include "core/Group.h"
@@ -25,7 +26,11 @@
 #include "gui/DatabaseIcons.h"
 
 #include <QDataStream>
+#include <QDir>
 #include <QXmlStreamWriter>
+#ifdef KPXC_FEATURE_NETWORK
+#include <QTcpSocket>
+#endif
 
 #include <botan/data_src.h>
 #include <botan/pkcs8.h>
@@ -56,6 +61,26 @@ namespace KeeShareSettings
             }
             specific(reader);
         }
+
+        bool defaultUncProbe(const QString& host, int timeoutMs)
+        {
+#ifdef KPXC_FEATURE_NETWORK
+            QTcpSocket socket;
+            socket.connectToHost(host, 445);
+            if (socket.waitForConnected(timeoutMs)) {
+                socket.disconnectFromHost();
+                return true;
+            }
+            socket.abort();
+            return false;
+#else
+            Q_UNUSED(host);
+            Q_UNUSED(timeoutMs);
+            return true;
+#endif
+        }
+
+        std::function<bool(const QString&, int)> s_uncProbeFunc = defaultUncProbe;
     } // namespace
 
     void Certificate::serialize(QXmlStreamWriter& writer, const Certificate& certificate)
@@ -284,6 +309,63 @@ namespace KeeShareSettings
         return (type & ImportFrom) != 0 && !path.isEmpty();
     }
 
+    QString Reference::extractUncHost(const QString& path)
+    {
+        const QString trimmed = path.trimmed();
+#ifndef Q_OS_WIN
+        if (!trimmed.startsWith("\\\\")) {
+            return {};
+        }
+#endif
+        const QString normalized = QDir::fromNativeSeparators(trimmed);
+        QString remaining;
+        if (normalized.startsWith("//?/UNC/", Qt::CaseInsensitive)) {
+            remaining = normalized.mid(8);
+        } else if (normalized.startsWith("//") && !normalized.startsWith("///")) {
+            remaining = normalized.mid(2);
+        } else {
+            return {};
+        }
+
+        const int slashIndex = remaining.indexOf('/');
+        const QString host = (slashIndex >= 0) ? remaining.left(slashIndex) : remaining;
+        if (host.isEmpty() || host == "?" || host == ".") {
+            return {};
+        }
+        return host;
+    }
+
+    bool Reference::isUncPath(const QString& path)
+    {
+        return !extractUncHost(path).isEmpty();
+    }
+
+    bool Reference::isUncPath() const
+    {
+        return isUncPath(path);
+    }
+
+    bool Reference::isUncPathActive(const QString& path, int timeoutSeconds)
+    {
+        const QString host = extractUncHost(path);
+        if (host.isEmpty()) {
+            return true;
+        }
+
+        const int timeoutMs = qBound(MinUncTimeout, timeoutSeconds, MaxUncTimeout) * 1000;
+        return s_uncProbeFunc(host, timeoutMs);
+    }
+
+    void Reference::setUncProbeFunc(std::function<bool(const QString& host, int timeoutMs)> func)
+    {
+        s_uncProbeFunc = func ? std::move(func) : defaultUncProbe;
+    }
+
+    void Reference::resetUncProbeFunc()
+    {
+        s_uncProbeFunc = defaultUncProbe;
+    }
+
     bool Reference::operator<(const Reference& other) const
     {
         if (type != other.type) {
@@ -294,7 +376,8 @@ namespace KeeShareSettings
 
     bool Reference::operator==(const Reference& other) const
     {
-        return path == other.path && uuid == other.uuid && password == other.password && type == other.type;
+        return path == other.path && uuid == other.uuid && password == other.password && type == other.type
+               && uncTimeout == other.uncTimeout;
     }
 
     QString Reference::serialize(const Reference& reference)
@@ -320,6 +403,11 @@ namespace KeeShareSettings
             writer.writeStartElement("KeepGroups");
             writer.writeCharacters(reference.keepGroups ? "True" : "False");
             writer.writeEndElement();
+            if (reference.uncTimeout != DefaultUncTimeout) {
+                writer.writeStartElement("UncTimeout");
+                writer.writeCharacters(QString::number(reference.uncTimeout));
+                writer.writeEndElement();
+            }
         });
     }
 
@@ -354,6 +442,12 @@ namespace KeeShareSettings
                     reference.password = QString::fromUtf8(QByteArray::fromBase64(reader.readElementText().toLatin1()));
                 } else if (reader.name().toString() == "KeepGroups") {
                     reference.keepGroups = reader.readElementText().compare("True") == 0;
+                } else if (reader.name().toString() == "UncTimeout") {
+                    bool ok = false;
+                    const int timeout = reader.readElementText().toInt(&ok);
+                    if (ok && timeout >= MinUncTimeout && timeout <= MaxUncTimeout) {
+                        reference.uncTimeout = timeout;
+                    }
                 } else {
                     qDebug("Unknown Reference element %s", qPrintable(reader.name().toString()));
                     reader.skipCurrentElement();
